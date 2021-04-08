@@ -8,7 +8,7 @@ setuptools.setup(
     version="0.0.5",
     author="poshui",
     author_email="poshui@foxmail.com",
-    description="便捷的将dict对象存储到Database[sqlite]中 Conveniently store the dict object in Database[sqlite]",
+    description="便捷的将dict对象存储到Database[sqlite]中 \nConveniently store the dict object in Database[sqlite]",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/wordhui/dict_to_db",

@@ -1,11 +1,13 @@
 import re
+import sys
 import time
 import json
 import pickle
+import logging
 import sqlite3
 import datetime
 from threading import Lock
-from typing import List, Union, Iterable, Callable, Generator
+from typing import List, Union, Iterable, Callable, Generator, Tuple
 
 from openpyxl import load_workbook, Workbook
 
@@ -15,11 +17,20 @@ UPDATE_SQL_TEMPLATE = f"update{' '}[{{table_name}}] set {{update_column}} where 
 DELETE_SQL_TEMPLATE = f"delete from{' '}[{{table_name}}] where {{where}};"
 SELECT_SQL_TEMPLATE = f"select {{select_column}} from{' '}[{{table_name}}] where {{where}};"
 REPLACE_SQL_TEMPLATE = f"replace into{' '}[{{table_name}}]({{columns}}) values({{values}});"
+INSERT_OR_UPDATE_SQL_TEMPLATE = f"replace into{' '}[{{table_name}}]({{columns}}) values({{values}});"
 ADD_COLUMN_SQL_TEMPLATE = f"alter table{' '}[{{table_name}}] add {{column_info}};"
+SELECT_TABLE_INDEX_NAMES = f"{'select'} name from MAIN.[sqlite_master] where type='index' and tbl_name=:table_name;"
+PRAGMA_INDEX = "PRAGMA index_info({index_name});"
 TABLE_TYPE_INFO = {str: 'text', int: 'integer', float: 'double', bool: 'boolean', datetime.date: 'date',
                    datetime.datetime: "timestamp", list: 'json_text', dict: 'json_text', tuple: 'tuple_text',
                    set: 'set_text'}
 TABLE_COLUMN_SHORTHAND = {'pk': 'primary key', 'uq': 'unique'}
+log = logging.getLogger("dict_to_db")
+formatter = logging.Formatter('%(asctime)s %(levelname)-5s: %(message)s')
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+log.addHandler(console_handler)
+log.setLevel(logging.INFO)
 
 
 def get_excel_title_by_index(index):
@@ -73,7 +84,8 @@ class DictToDb(object):
     def __init__(self, database: str = ":memory:", timeout: float = 5.0, detect_types: int = sqlite3.PARSE_DECLTYPES,
                  isolation_level: str = "DEFERRED", check_same_thread: bool = True,
                  cached_statements: int = 100, uri=False, row_factory: Callable = dict_factory,
-                 insert_time: bool = True, update_time: bool = True, export: bool = True, auto_commit: bool = True):
+                 insert_time: bool = True, update_time: bool = True, export: bool = True, auto_commit: bool = True,
+                 auto_alter: bool = True):
         """
         :param database:数据库路径，也可以是 :memory: 表示这是一个内存数据库
         :param timeout:连接超时时间
@@ -87,12 +99,14 @@ class DictToDb(object):
         :param update_time 默认是否给表添加更新时间数据列， 这里是全局设置，可以被方法内的update_time参数局部覆盖
         :param export 默认是否给表添加export数据列 ，这里是全局设置，可以被方法内的export参数局部覆盖
         :param auto_commit 是否自动执行commit语句，这里是全局设置，可以被方法内的commit参数局部覆盖
+        :param auto_alter 是否自动执行alter 表结构，这里是全局设置，可以被方法内的auto_alter参数局部覆盖
         """
         self.db = sqlite3.connect(database, timeout=timeout, detect_types=detect_types, isolation_level=isolation_level,
                                   check_same_thread=check_same_thread, cached_statements=cached_statements,
                                   uri=uri)
         self._tables = {}
         self._insert_sql = {}
+        self._insert_or_update_sql = {}
         self._update_sql = {}
         self._delete_sql = {}
         self._replace_sql = {}
@@ -102,6 +116,7 @@ class DictToDb(object):
         self._update_time = update_time
         self._export = export
         self._auto_commit = auto_commit
+        self._auto_alter = auto_alter
         self._check_same_thread = check_same_thread
         self._re_pattern = {
             "pk": re.compile(r'primary\s+key$')
@@ -124,7 +139,7 @@ class DictToDb(object):
         :param insert_time: 是否给数据加入一列插入时间列
         :param update_time: 是否给数据加入一列更新时间列
         :param export: 是否给数据加入一列导出数据列
-        :param auto_alter:
+        :param auto_alter: 是否自动alter表结构
         """
         if insert_time is None:
             insert_time = self._insert_time
@@ -134,6 +149,8 @@ class DictToDb(object):
             export = self._export
         if commit is None:
             commit = self._auto_commit
+        if auto_alter is None:
+            auto_alter = self._auto_alter
         if isinstance(data, dict):
             insert_data = data
         elif isinstance(data, Generator):
@@ -152,62 +169,54 @@ class DictToDb(object):
         try:
             self._execute_insert_sql(data, insert_data, insert_sql, table_name)
         except sqlite3.OperationalError as e:
-            if str(e).startswith("no such column") or 'no column named' in str(e):
+            if auto_alter and (str(e).startswith("no such column") or 'no column named' in str(e)):
                 self._alter_table_add_column_by_dict(insert_data, table_name=table_name)
                 self._execute_insert_sql(data, insert_data, insert_sql, table_name)
+            else:
+                raise e
         self._commit(commit)
 
-    def update(self, update: Union[dict, Iterable[dict]], where: Union[dict, Iterable[dict]], table_name: str,
-               commit: bool = None,
-               update_time: bool = None):
+    def insert_or_update(self, data: Union[dict, Iterable[dict], Generator[dict, None, None]], table_name: str = None,
+                         commit: bool = None, insert_time: bool = None, update_time: bool = None, export: bool = None,
+                         auto_alter: bool = None, auto_update_time: bool = True, ignore_error=None):
         """
-        简单的更新函数，根据传入的dict更新数据库的值，并可以选择自动填写update_time的值
-        :param update: 需要更新的字段
-        :param where: 更新条件
-        :param table_name: 需要更新的表名
-        :param commit: 是否自动commit，可以覆盖全局的commit设置
-        :param update_time: 是否自动填写更新时间，可以覆盖全局的更新时间配置
+        不存在则插入，存在则更新的方法 【此方法性能略差于 insert 和insert_replace】
+        根据dict插入数据的函数，如果当前dict数据结构没有在数据库中建表，此函数则会自动建表
+        :param data: 需要插入的dict 或者可迭代对象，且这个可迭代对象的子元素为dict
+        :param table_name: 用户自定义表名，如果没有填写，则表名为t1,t2.....tn规则，依次递增
+        :param commit: 是否插入一条语句后立即执行commit
+        :param insert_time: 是否给数据加入一列插入时间列
+        :param update_time: 是否给数据加入一列更新时间列
+        :param export: 是否给数据加入一列导出数据列
+        :param auto_alter: 是否自动alter表结构
+        :param auto_update_time: 是否在更新操作中自动更新update_time的值
+        :param ignore_error: 是否在单次保存或更新中忽略某些异常以保证，数据大部分都插入到数据库中
         """
-        if isinstance(where, Iterable):
-            if isinstance(update, dict):
-                update = [update] * len(where)
-            if len(update) != len(where):
-                raise Exception("参数数量不匹配")
-            for count, _update in enumerate(update):
-                _where = where[count]
-                self.update(_update, _where, table_name, commit, update_time)
-            return
-        if update_time is None:
-            update_time = self._update_time
-        if commit is None:
-            commit = self._auto_commit
-        if table_name not in self._tables.keys():
-            raise Exception(f"no table by table_name:{table_name}")
-        update_sql = self._get_update_sql(update_data=update, where=where, table_name=table_name,
-                                          update_time=update_time)
-        update_values = self._get_update_column_and_where_values(update, where, update_time, table_name)
-        try:
-            self.execute(update_sql, update_values)
-        except sqlite3.OperationalError as e:
-            if str(e).startswith("no such column") or 'no column named' in str(e):
-                self._alter_table_add_column_by_dict(update, table_name=table_name)
-                self.execute(update_sql, update_values)
-        self._commit(commit)
-
-    def insert_or_update(self):
-        """暂时缺省的方法"""
-        pass
+        if isinstance(data, dict):
+            self._insert_or_update(data=data, table_name=table_name, commit=commit, insert_time=insert_time,
+                                   update_time=update_time, export=export, auto_alter=auto_alter,
+                                   auto_update_time=auto_update_time, ignore_error=ignore_error)
+        elif isinstance(data, (Generator, Iterable)):
+            for d in data:
+                self._insert_or_update(data=d, table_name=table_name, commit=commit, insert_time=insert_time,
+                                       update_time=update_time, export=export, auto_alter=auto_alter,
+                                       auto_update_time=auto_update_time, ignore_error=ignore_error)
+        else:
+            raise Exception("不支持的类型 Unsupported type")
 
     def insert_or_replace(self, data: Union[dict, Iterable[dict], Generator[dict, None, None]], table_name: str = None,
-                          commit: bool = None, insert_time: bool = None, update_time: bool = None, export: bool = None):
+                          commit: bool = None, insert_time: bool = None, update_time: bool = None, export: bool = None,
+                          auto_alter: bool = True):
         """
-        根据dict插入数据的函数，如果当前dict数据结构没有在数据库中建表，此函数则会自动建表
+        不存在则插入，存在则替换的函数，注：受sqlite replace方法的限制，如果某个字段没有填写被替换的值，这个值将会替换为Null
+        根据dict插入或替换数据的函数，如果当前dict数据结构没有在数据库中建表，此函数则会自动建表
         :param data: 需要插入的dict 或者dict的list
         :param table_name: 用户自定义表名，如果没有填写，则表名为t1,t2.....tn规则，依次递增
         :param commit: 是否插入一条语句后立即执行commit
         :param insert_time: 是否给数据加入一列插入时间列
         :param update_time: 是否给数据加入一列更新时间列
         :param export: 是否给数据加入一列导出数据列
+        :param auto_alter: 是否自动alter表结构
         """
         if insert_time is None:
             insert_time = self._insert_time
@@ -217,6 +226,8 @@ class DictToDb(object):
             export = self._export
         if commit is None:
             commit = self._auto_commit
+        if auto_alter is None:
+            auto_alter = self._auto_alter
         if isinstance(data, dict):
             insert_data = data
         elif isinstance(data, Generator):
@@ -235,16 +246,81 @@ class DictToDb(object):
         try:
             self._execute_replace_sql(data, insert_data, replace_sql, table_name)
         except sqlite3.OperationalError as e:
-            if str(e).startswith("no such column") or 'no column named' in str(e):
+            if auto_alter and (str(e).startswith("no such column") or 'no column named' in str(e)):
                 self._alter_table_add_column_by_dict(insert_data, table_name=table_name)
                 self._execute_replace_sql(data, insert_data, replace_sql, table_name)
+            else:
+                raise e
+        self._commit(commit)
+
+    def update(self, update: Union[dict, List[dict], Tuple[dict]], where: Union[dict, List[dict], Tuple[dict]],
+               table_name: str, commit: bool = None, update_time: bool = None, auto_alter: bool = True):
+        """
+        简单的更新函数，根据传入的dict更新数据库的值，并可以选择自动填写update_time的值
+        :param update: 需要更新的字段
+        :param where: 更新条件
+        :param table_name: 需要更新的表名
+        :param commit: 是否自动commit，可以覆盖全局的commit设置
+        :param update_time: 是否自动填写更新时间，可以覆盖全局的更新时间配置
+        :param auto_alter: 是否自动alter表结构
+        """
+        if update_time is None:
+            update_time = self._update_time
+        if commit is None:
+            commit = self._auto_commit
+        if auto_alter is None:
+            auto_alter = self._auto_alter
+        if table_name not in self._tables.keys():
+            raise Exception(f"no table by table_name:{table_name}")
+        if isinstance(update, dict):
+            self._update(update, where, table_name=table_name, update_time=update_time,
+                         auto_alter=auto_alter)
+        elif isinstance(update, (list, tuple)):
+            if len(update) != len(where):
+                raise Exception(f"update 和 where参数值不匹配")
+            for count, data in enumerate(update):
+                _where = where[count]
+                self._update(data, _where, table_name=table_name, update_time=update_time,
+                             auto_alter=auto_alter)
+        self._commit(commit)
+
+    def select(self, table_name: str, select: List[str] = None, where: dict = None, select_all: bool = True):
+        """考虑到select 语句的方便程度，推荐使用 execute函数来执行查询语句,来实现更大的灵活性
+        :param select:需要查询的列
+        :param where: 查询条件
+        :param table_name:表名
+        :param select_all:是否查询所有，若为TRUE则返回所有数据，若为False则返回一条数据
+        """
+        select_sql = self._get_select_sql(table_name, select, where)
+        if where:
+            select_value = self._adapt_dict_value(where, table_name)
+            result = self.execute(select_sql, select_value)
+        else:
+            result = self.execute(select_sql)
+        if select_all:
+            return result.fetchall()
+        else:
+            return result.fetchone()
+
+    def delete(self, where: dict, table_name: str, commit: bool = None):
+        """考虑到 delete语句的方便程度，推荐使用 execute函数来执行查询语句
+        :param table_name:表名
+        :param where:查询条件
+        :param commit:是否立即提交
+        """
+        if commit is None:
+            commit = self._auto_commit
+        delete_sql = self._get_delete_sql(table_name, where)
+        delete_value = self._adapt_dict_value(where, table_name)
+        self.execute(delete_sql, delete_value)
         self._commit(commit)
 
     def excel_to_db(self, excel: str, table_names: List[str] = None, internal_table_name: bool = False,
                     transform_string: bool = True, title_to_column_name: bool = True,
                     title_row_index: List[int] = None, data_row_start_index: List[int] = None,
-                    columns_desc: List[Iterable[str]] = None, appends_data: List[dict] = None,
-                    insert_time: bool = False, update_time: bool = False, export: bool = False, ignore_error=None):
+                    columns_desc: List[dict] = None, appends_data: List[dict] = None,
+                    insert_time: bool = False, update_time: bool = False, execute_func: str = 'insert',
+                    export: bool = False, ignore_error=None):
         """
         将结构比较单一Excel数据保存到数据库中，默认程序以Excel中每个有数据的sheet name为表名，
         每个sheet 内容行第一行为字段名，后续的[1:]行则会保存到数据库
@@ -261,6 +337,7 @@ class DictToDb(object):
         :param insert_time: 是否添加插入时间列
         :param update_time：是否添加更新时间列
         :param export: 是否添加export数据列
+        :param execute_func: 执行的方法，可选的有insert，replace，insert_or_update
         :param ignore_error: 是否在单次保存中忽略某些异常以保证，文件数据全部保存到Excel中
         """
         start_time = time.time()
@@ -300,11 +377,18 @@ class DictToDb(object):
                             if not blank_line:
                                 if appends_data:
                                     data.update(appends_data[sheet_count])
-                                self.insert(data, table_name, commit=False, insert_time=insert_time,
-                                            update_time=update_time, export=export)
+                                if execute_func == "insert":
+                                    self.insert(data, table_name, commit=False, insert_time=insert_time,
+                                                update_time=update_time, export=export)
+                                elif execute_func == "insert_or_update":
+                                    self.insert_or_update(data, table_name, commit=False, insert_time=insert_time,
+                                                          update_time=update_time, export=export)
+                                elif execute_func == "replace":
+                                    self.insert_or_replace(data, table_name, commit=False, insert_time=insert_time,
+                                                           update_time=update_time, export=export)
                     except Exception as e:
                         if ignore_error and isinstance(e, ignore_error):
-                            pass
+                            log.warning(e)
                         else:
                             raise e
                 self._commit(commit=True)
@@ -313,14 +397,21 @@ class DictToDb(object):
             wb.close()
 
     def select_and_save_excel(self, sql: str, excel: str = None, transform_string: bool = True,
-                              sql_value: Iterable = None):
+                              sql_value: Iterable = None, not_save_column: list = None,
+                              auto_update_export: bool = False, update_export_by_column: List[str] = None,
+                              update_export_table_name: str = None):
         """
         从数据库导出数据到Excel表格中
         :param sql: 查询的sql语句
         :param excel: Excel文件路径，如果Excel参数为None，则导出文件名格式为：f'dict_to_db_export_{datetime.now()}.xlsx'
         :param transform_string:是否将数据库中的值转化为字符串存储到Excel中
         :param sql_value:sql 位置参数的值
+        :param not_save_column 查询出来字段中，不保存到Excel的字段
+        :param auto_update_export 【不常见使用方法，可以不了解】是否自动更新导出后数据的export字段的值
+        :param update_export_by_column 【不常见使用方法，可以不了解】根据哪些字段做where条件自动更新export的值
+        :param update_export_table_name 【不常见使用方法，可以不了解】根据自动更新哪个表 export的值
         """
+        not_save_column = set(not_save_column) if not_save_column else set()
         wb = Workbook(write_only=True)
         ws = wb.create_sheet("sheet1")
         ws.freeze_panes = "A2"
@@ -328,18 +419,25 @@ class DictToDb(object):
             rows = self.execute(sql, sql_value).fetchall()
         else:
             rows = self.execute(sql, ).fetchall()
+        update_data = []
         for count, row_data in enumerate(rows):
             if count == 0:
-                ws.append(list(row_data.keys()))
+                ws.append([k for k in row_data.keys() if k not in not_save_column])
             if transform_string:
-                ws.append([str(d) if d else '' for d in row_data.values()])
+                ws.append([str(d) if d else '' for k, d in row_data.items() if k not in not_save_column])
             else:
-                ws.append(list(row_data.values()))
+                ws.append([d if d else '' for k, d in row_data.items() if k not in not_save_column])
+            if auto_update_export:
+                update_data.append({k: row_data[k] for k in update_export_by_column})
         if excel is None:
             excel = f'dict_to_db_export_{datetime.datetime.now().strftime("%Y-%m-%d %H时%M点%S分")}.xlsx'
         if rows:
             wb.save(excel)
             print(f"导出：{excel}")
+            if auto_update_export:
+                update = {'export': 1}
+                updates = [update for i in range(len(update_data))]
+                self.update(updates, where=update_data, table_name=update_export_table_name)
         else:
             print(f"当前查询无数据导出...")
 
@@ -355,37 +453,6 @@ class DictToDb(object):
         :return: 返回建表语句
         """
         return self._create_table_by_dict(data, table_name, insert_time, update_time, export)
-
-    def select(self, table_name: str, select: List[str] = None, where: dict = None, select_all: bool = True):
-        """考虑到select 语句的方便程度，推荐使用 execute函数来执行查询语句,来实现更大的灵活性
-        :param select:需要查询的列
-        :param where: 查询条件
-        :param table_name:表名
-        :param select_all:是否查询所有，若为TRUE则返回所有数据，若为False则返回一条数据
-        """
-        select_sql = self._get_select_sql(table_name, select, where)
-        if where:
-            select_value = self._adapt_dict_value(where, table_name)
-            result = self.execute(select_sql, select_value)
-        else:
-            result = self.execute(select_sql)
-        if select_all:
-            return result.fetchall()
-        else:
-            return result.fetchone()
-
-    def delete(self, where: dict, table_name: str, commit: bool = None):
-        """考虑到 delete语句的方便程度，推荐使用 execute函数来执行查询语句
-        :param table_name:表名
-        :param where:查询条件
-        :param commit:是否立即提交
-        """
-        if commit is None:
-            commit = self._auto_commit
-        delete_sql = self._get_delete_sql(table_name, where)
-        delete_value = self._adapt_dict_value(where, table_name)
-        self.execute(delete_sql, delete_value)
-        self._commit(commit)
 
     def execute(self, sql: str, *args, **kwargs):
         """
@@ -520,7 +587,6 @@ class DictToDb(object):
             if not isinstance(column, str):
                 raise Exception('cn:需要保存到数据库的dict的key必须可以转化为字符串\nen:The key of the dict that '
                                 'needs to be saved to the database must be convertible into a string')
-            dict_column.add(column)
             if '@' in column:
                 dict_column.add(column.split('@')[0])
             elif '#' in column:
@@ -644,6 +710,42 @@ class DictToDb(object):
         self._insert_sql[insert_sql_key] = insert_sql
         return insert_sql
 
+    def _get_insert_or_update_sql_by_dict(self, data: dict, table_name: str) -> str:
+        """
+        根据传入的字典，和表名，拼接不存在则插入，存在则更新的SQL
+        """
+        insert_or_update_sql_key = f"{'-'.join(data.keys())}_{table_name}"
+        if insert_or_update_sql_key in self._insert_or_update_sql:
+            return self._insert_or_update_sql[insert_or_update_sql_key]
+        insert_column_names = []
+        for column in data.keys():
+            if '@' in column:
+                insert_column_names.append(f"[{column.split('@')[0]}]")
+            elif '#' in column:
+                insert_column_names.append(f"[{column.split('#')[0]}]")
+            else:
+                insert_column_names.append(f"[{column}]")
+        columns = ", ".join(insert_column_names)
+        values = ",".join(['?' for i in range(len(insert_column_names))])
+        insert_or_update_sql = INSERT_SQL_TEMPLATE.format(table_name=table_name, columns=columns, values=values)
+        self._insert_or_update_sql[insert_or_update_sql_key] = insert_or_update_sql
+        return insert_or_update_sql
+
+    @staticmethod
+    def _get_update_data_by_where_column(insert_data, where_column):
+        """根据where column 自动从inset data中获取update data 和 where data"""
+        insert_column_data = {}
+        for column, value in insert_data.items():
+            if '@' in column:
+                insert_column_data[column.split('@')[0]] = value
+            elif '#' in column:
+                insert_column_data[column.split('#')[0]] = value
+            else:
+                insert_column_data[column] = value
+        update_data = {key: value for key, value in insert_column_data.items() if key not in where_column}
+        where_data = {key: value for key, value in insert_column_data.items() if key in where_column}
+        return update_data, where_data
+
     def _get_replace_sql_by_dict(self, data: dict, table_name: str) -> str:
         """
         根据传入的字典和表名拼接 插入的SQL语句
@@ -684,6 +786,43 @@ class DictToDb(object):
             self.execute(replace_sql, self._adapt_dict_value(data, table_name))
         elif isinstance(data, Iterable):
             self.executemany(replace_sql, self._adapt_dict_values(data, table_name))
+
+    def _insert_or_update(self, data: Union[dict, Iterable[dict], Generator[dict, None, None]], table_name: str = None,
+                          commit: bool = None, insert_time: bool = None, update_time: bool = None, export: bool = None,
+                          auto_alter: bool = None, auto_update_time: bool = True, ignore_error=None):
+        """insert or update 函数的调用逻辑"""
+        try:
+            self.insert(data, table_name=table_name, commit=commit, insert_time=insert_time,
+                        update_time=update_time, export=export, auto_alter=auto_alter)
+        except sqlite3.IntegrityError as e:
+            if 'UNIQUE constraint failed' in str(e):
+                where_column = str(e).replace("UNIQUE constraint failed: ", "").replace(f"{table_name}.",
+                                                                                        '').split(", ")
+                update_data, where_data = self._get_update_data_by_where_column(data, where_column)
+                self.update(update_data, where_data, table_name=table_name, commit=commit, update_time=update_time,
+                            auto_alter=auto_alter)
+            else:
+                raise e
+        except Exception as e:
+            if ignore_error and isinstance(e, ignore_error):
+                log.warning(e)
+            else:
+                raise e
+
+    def _update(self, update: Union[dict, List[dict], Tuple[dict]], where: Union[dict, List[dict], Tuple[dict]],
+                table_name: str, update_time: bool = None, auto_alter: bool = True):
+        """update 函数的执行逻辑"""
+        update_sql = self._get_update_sql(update_data=update, where=where, table_name=table_name,
+                                          update_time=update_time)
+        update_values = self._get_update_column_and_where_values(update, where, update_time, table_name)
+        try:
+            self.execute(update_sql, update_values)
+        except sqlite3.OperationalError as e:
+            if auto_alter and (str(e).startswith("no such column") or 'no column named' in str(e)):
+                self._alter_table_add_column_by_dict(update, table_name=table_name)
+                self.execute(update_sql, update_values)
+            else:
+                raise e
 
     def _get_update_sql(self, update_data: dict, where: dict, table_name: str, update_time: bool):
         """根据传入的参数，拼接更新的SQL语句"""
