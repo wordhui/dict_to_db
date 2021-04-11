@@ -2,12 +2,13 @@ import re
 import sys
 import time
 import json
+import copy
 import pickle
 import logging
 import sqlite3
 import datetime
 from threading import Lock
-from typing import List, Union, Iterable, Callable, Generator, Tuple
+from typing import List, Union, Iterable, Callable, Generator, Tuple, Dict
 
 from openpyxl import load_workbook, Workbook
 
@@ -315,25 +316,27 @@ class DictToDb(object):
         self.execute(delete_sql, delete_value)
         self._commit(commit)
 
-    def excel_to_db(self, excel: str, table_names: List[str] = None, internal_table_name: bool = False,
+    def excel_to_db(self, excel: str, table_names: Dict[str, str] = None, internal_table_name: bool = False,
                     transform_string: bool = True, title_to_column_name: bool = True,
-                    title_row_index: List[int] = None, data_row_start_index: List[int] = None,
-                    columns_desc: List[dict] = None, appends_data: List[dict] = None,
-                    insert_time: bool = False, update_time: bool = False, execute_func: str = 'insert',
-                    export: bool = False, ignore_error=None):
+                    title_row_index: Dict[str, int] = None, data_row_start_index: Dict[str, int] = None,
+                    columns_desc: Dict[str, dict] = None,
+                    columns_pretreatment_function: Dict[str, Dict[str, Callable]] = None,
+                    appends_data: Dict[str, dict] = None, insert_time: bool = False, update_time: bool = False,
+                    execute_func: str = 'insert', export: bool = False, ignore_error=None):
         """
         将结构比较单一Excel数据保存到数据库中，默认程序以Excel中每个有数据的sheet name为表名，
         每个sheet 内容行第一行为字段名，后续的[1:]行则会保存到数据库
         :param excel: Excel文件路径
-        :param table_names: 覆盖默认的sheet name作为表名，指定为table_names里面的表名，注意这里table_name的数量要和有数据的sheet name数量匹配
+        :param table_names: 覆盖默认的sheet name作为表名，指定为table_names里面的表名，例如：{"sheet1":"user"}将sheet1重命名为user表
         :param internal_table_name:系统自动设置表名,无视sheet name 和 table_names参数里面的值
         :param transform_string:是否将所有表格的值转化为字符串存储（数据库中字段类型即为text）， 若此参数为false（有的Excel格式混乱，可能出错）
                                 ，则所有表值按照openpyxl读取为准，数据库内字段的类型以表格第二行每格数据的值的类型，来确定
         :param title_to_column_name: 是否根据Excel表格里面的表格标题名，做字段名，如果设置为false，则column名规则类似Excel表格从A-z 然后是AA-AZ 然后是BA-BZ...
-        :param title_row_index: 每个sheet标题列所在的位置，默认为Excel中的第一列  注：Excel有几个sheet就需要传几个值，如[0,2]
-        :param data_row_start_index: 每个sheet数据列起始位置，默认为Excel中的第二列开始 注：Excel有几个sheet就需要传几个值，如[3,2]
-        :param columns_desc: 给指定的Excel列设置建表的描述信息，如设置为主键，unique等以及给某列设置数据库中存储类型 如:[{'A1':'@text#pk__not null__unique'},{}]
-        :param appends_data: 插入Excel不包含的额外的数据列到数据库中
+        :param title_row_index: 每个sheet标题列所在的位置，默认为Excel中的第一列 如：{"sheet1":3} #sheet的title以第三行为准
+        :param data_row_start_index: 每个sheet数据列起始位置，默认为Excel中的第二列开始 如：{"sheet1":20} # sheet1的数据从第20行开始保存
+        :param columns_desc: 给指定的Excel列设置建表的描述信息，如设置为主键，unique等以及给某列设置数据库中存储类型 如: {'sheet1':{'A1':'@text#pk__not null__unique'}}
+        :param columns_pretreatment_function: 给指定的Excel列 设置预处理函数，如 {'sheet1':{'A1':lambda x:float(x)}}
+        :param appends_data: 插入Excel不包含的额外的数据列到数据库中，如给sheet1中的每行数据多插入一条 age数据：{'sheet1':{'age@text#pk':33}}
         :param insert_time: 是否添加插入时间列
         :param update_time：是否添加更新时间列
         :param export: 是否添加export数据列
@@ -347,45 +350,56 @@ class DictToDb(object):
             sheet_names = wb.sheetnames
             for sheet_count, sheet_name in enumerate(sheet_names):
                 ws = wb[sheet_name]
-                column_names, create_table_dict = \
-                    self._get_create_table_dict_by_excel_sheet(ws, title_to_column_name, title_row_index,
-                                                               data_row_start_index, sheet_count, transform_string,
-                                                               columns_desc, appends_data)
+                sheet_column_desc = columns_desc.get(sheet_name, {}) if columns_desc else {}
+                sheet_append_data = appends_data.get(sheet_name, {}) if appends_data else {}
+                sheet_title_index = title_row_index.get(sheet_name, 1) if title_row_index else 1
+                sheet_data_row_start_index = data_row_start_index.get(sheet_name, 2) if data_row_start_index else 2
+                sheet_columns_pretreatment_function = columns_pretreatment_function.get(sheet_name,
+                                                                                        {}) if columns_pretreatment_function else {}
+                column_names, create_table_dict, first_column_names = \
+                    self._get_create_table_dict_by_excel_sheet(ws, title_to_column_name, sheet_title_index,
+                                                               sheet_data_row_start_index, sheet_count,
+                                                               transform_string,
+                                                               sheet_column_desc, sheet_append_data)
                 if not column_names:
                     continue
                 if internal_table_name:
                     table_name = self._get_table_name_by_dict_keys(create_table_dict, insert_time, update_time, export)
                 else:
                     table_name = sheet_name
-                    if table_names:
-                        table_name = table_names[sheet_count]
+                    if table_names and table_names.get(sheet_name):
+                        table_name = table_names.get(sheet_name)
                 for count, row in enumerate(ws.rows):
                     try:
-                        if (data_row_start_index is None and count >= 1) or (
-                                data_row_start_index and count >= data_row_start_index[sheet_count]):
+                        if count >= sheet_data_row_start_index:
                             data = {}
                             blank_line = True  # 判断数据是不是全空
                             for cell_count, cell in enumerate(row):
                                 cell_value = cell.value
+                                first_column_name = first_column_names[cell_count]
+                                columns_func = sheet_columns_pretreatment_function.get(
+                                    first_column_name)
                                 if cell_value is None:
                                     cell_value = ""
-                                if transform_string:
+                                if transform_string and columns_func is None:
                                     cell_value = str(cell_value)
                                 if cell_value:
                                     blank_line = False
+                                    if columns_func:
+                                        cell_value = columns_func(cell_value)
                                 data[column_names[cell_count]] = cell_value
                             if not blank_line:
                                 if appends_data:
-                                    data.update(appends_data[sheet_count])
+                                    data.update(sheet_append_data)
                                 if execute_func == "insert":
                                     self.insert(data, table_name, commit=False, insert_time=insert_time,
-                                                update_time=update_time, export=export)
+                                                update_time=update_time, export=export, auto_alter=False)
                                 elif execute_func == "insert_or_update":
                                     self.insert_or_update(data, table_name, commit=False, insert_time=insert_time,
-                                                          update_time=update_time, export=export)
+                                                          update_time=update_time, export=export, auto_alter=False)
                                 elif execute_func == "replace":
                                     self.insert_or_replace(data, table_name, commit=False, insert_time=insert_time,
-                                                           update_time=update_time, export=export)
+                                                           update_time=update_time, export=export, auto_alter=False)
                     except Exception as e:
                         if ignore_error and isinstance(e, ignore_error):
                             log.warning(e)
@@ -393,6 +407,76 @@ class DictToDb(object):
                             raise e
                 self._commit(commit=True)
             print(f"保存完成，共耗时：{round((time.time() - start_time), 2)} S")
+        finally:
+            wb.close()
+
+    def excel_to_dict_list(self, excel: str, transform_string: bool = True, title_to_column_name: bool = True,
+                           title_row_index: Dict[str, int] = None, data_row_start_index: Dict[str, int] = None,
+                           columns_desc: Dict[str, dict] = None,
+                           columns_pretreatment_function: Dict[str, Dict[str, Callable]] = None,
+                           appends_data: Dict[str, dict] = None, ignore_error=None):
+        """
+        将结构比较单一Excel数据 转化为dict 格式返回，用生成器的方式
+        每个sheet 内容行第一行为字段名，后续的[1:]行则会保存到数据库
+        :param excel: Excel文件路径
+        :param transform_string:是否将所有表格的值转化为字符串返回
+        :param title_to_column_name: 是否根据Excel表格里面的表格标题名，做dict Key，如果设置为false，则Dict 的Key规则类似Excel表格从A-z 然后是AA-AZ 然后是BA-BZ...
+        :param title_row_index: 每个sheet标题列所在的位置，默认为Excel中的第一列 如：{"sheet1":3} #sheet的title以第三行为准
+        :param data_row_start_index: 每个sheet数据列起始位置，默认为Excel中的第二列开始 如：{"sheet1":20} # sheet1的数据从第20行开始保存
+        :param columns_desc: 给指定的Excel列设置建表的描述信息，如设置为主键，unique等以及给某列设置数据库中存储类型 如: {'sheet1':{'A1':'@text#pk__not null__unique'}}
+        :param columns_pretreatment_function: 给指定的Excel列 设置预处理函数，如 {'sheet1':{'A1':lambda x:float(x)}}
+        :param appends_data: 插入Excel不包含的额外的数据列到数据库中，如给sheet1中的每行数据多插入一条 age数据：{'sheet1':{'age@text#pk':33}}
+        :param ignore_error: 是否在单次保存中忽略某些异常以保证，文件数据全部保存到Excel中
+        """
+        start_time = time.time()
+        print(f"加载 {excel} 并通过生成器方式返回 dict")
+        wb = load_workbook(excel, read_only=True)
+        try:
+            sheet_names = wb.sheetnames
+            for sheet_count, sheet_name in enumerate(sheet_names):
+                ws = wb[sheet_name]
+                sheet_column_desc = columns_desc.get(sheet_name, {}) if columns_desc else {}
+                sheet_append_data = appends_data.get(sheet_name, {}) if appends_data else {}
+                sheet_title_index = title_row_index.get(sheet_name, 1) if title_row_index else 1
+                sheet_data_row_start_index = data_row_start_index.get(sheet_name, 2) if data_row_start_index else 2
+                sheet_columns_pretreatment_function = columns_pretreatment_function.get(sheet_name,
+                                                                                        {}) if columns_pretreatment_function else {}
+                column_names, create_table_dict, first_column_names = \
+                    self._get_create_table_dict_by_excel_sheet(ws, title_to_column_name, sheet_title_index,
+                                                               sheet_data_row_start_index, sheet_count,
+                                                               transform_string,
+                                                               sheet_column_desc, sheet_append_data)
+                if not column_names:
+                    continue
+                for count, row in enumerate(ws.rows):
+                    try:
+                        if count >= sheet_data_row_start_index:
+                            data = {}
+                            blank_line = True  # 判断数据是不是全空
+                            for cell_count, cell in enumerate(row):
+                                cell_value = cell.value
+                                first_column_name = first_column_names[cell_count]
+                                columns_func = sheet_columns_pretreatment_function.get(
+                                    first_column_name)
+                                if cell_value is None:
+                                    cell_value = ""
+                                if transform_string and columns_func is None:
+                                    cell_value = str(cell_value)
+                                if cell_value:
+                                    blank_line = False
+                                    if columns_func:
+                                        cell_value = columns_func(cell_value)
+                                data[column_names[cell_count]] = cell_value
+                            if not blank_line:
+                                if appends_data:
+                                    data.update(sheet_append_data)
+                                yield data
+                    except Exception as e:
+                        if ignore_error and isinstance(e, ignore_error):
+                            log.warning(e)
+                        else:
+                            raise e
+            print(f"加载完成，共耗时：{round((time.time() - start_time), 2)} S")
         finally:
             wb.close()
 
@@ -631,7 +715,7 @@ class DictToDb(object):
             if pk_column:
                 pk_column_list.append(pk_column)
         if insert_time:
-            column_info_list.append('insert_time timestamp default current_timestamp')
+            column_info_list.append("insert_time timestamp default (datetime('now','localtime'))")
         if update_time:
             column_info_list.append('update_time timestamp')
         if export:
@@ -900,12 +984,11 @@ class DictToDb(object):
 
     @staticmethod
     def _get_create_table_dict_by_excel_sheet(ws, title_to_column_name, title_row_index, data_row_start_index,
-                                              sheet_count, transform_string, columns_desc, appends_data):
+                                              sheet_count, transform_string, sheet_column_desc, sheet_append_data):
         column_names = []
         column_values = []
         for count, row in enumerate(ws.rows):
-            if (title_row_index is None and count == 0) or (
-                    title_row_index and count == title_row_index[sheet_count] + 1):
+            if title_row_index and count == title_row_index - 1:
                 if title_to_column_name:
                     for cell_count, cell in enumerate(row):
                         col_name = cell.value
@@ -915,8 +998,7 @@ class DictToDb(object):
                             column_names.append(get_excel_title_by_index(cell_count + 1))
                 else:
                     column_names = [get_excel_title_by_index(_ + 1) for _ in range(len(row))]
-            elif (data_row_start_index is None and count == 1) or (
-                    data_row_start_index and count == data_row_start_index[sheet_count] + 1):
+            elif count == data_row_start_index - 1:
                 for cell_count, cell in enumerate(row):
                     cell_value = cell.value
                     if cell_value is None:
@@ -926,15 +1008,16 @@ class DictToDb(object):
                     column_values.append(cell_value)
             if column_names and len(column_names) == len(column_values):
                 break  # 这里说明准确获取到column name 和column values了
-        if columns_desc and column_names:
-            for k, v in columns_desc[sheet_count].items():
+        first_column_names = copy.deepcopy(column_names)
+        if sheet_column_desc and column_names:
+            for k, v in sheet_column_desc.items():
                 for c, column in enumerate(column_names):
                     if column == k:
                         column_names[c] = column + v
         create_table_dict = {column_names[i]: column_values[i] for i in range(len(column_names))}
-        if appends_data and column_names:
-            create_table_dict.update(appends_data[sheet_count])
-        return column_names, create_table_dict
+        if sheet_append_data and column_names:
+            create_table_dict.update(sheet_append_data)
+        return column_names, create_table_dict, first_column_names
 
     def _adapt_dict_value(self, data: dict, table_name: str):
         """

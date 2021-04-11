@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="dict_to_db",
-    version="0.0.5",
+    version="0.0.6",
     author="poshui",
     author_email="poshui@foxmail.com",
     description="便捷的将dict对象存储到Database[sqlite]中 \nConveniently store the dict object in Database[sqlite]",
