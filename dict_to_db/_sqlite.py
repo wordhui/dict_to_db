@@ -26,12 +26,6 @@ TABLE_TYPE_INFO = {str: 'text', int: 'integer', float: 'double', bool: 'boolean'
                    datetime.datetime: "timestamp", list: 'json_text', dict: 'json_text', tuple: 'tuple_text',
                    set: 'set_text'}
 TABLE_COLUMN_SHORTHAND = {'pk': 'primary key', 'uq': 'unique'}
-log = logging.getLogger("dict_to_db")
-formatter = logging.Formatter('%(asctime)s %(levelname)-5s: %(message)s')
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(formatter)
-log.addHandler(console_handler)
-log.setLevel(logging.INFO)
 
 
 def get_excel_title_by_index(index):
@@ -85,8 +79,8 @@ class DictToDb(object):
     def __init__(self, database: str = ":memory:", timeout: float = 5.0, detect_types: int = sqlite3.PARSE_DECLTYPES,
                  isolation_level: str = "DEFERRED", check_same_thread: bool = True,
                  cached_statements: int = 100, uri=False, row_factory: Callable = dict_factory,
-                 insert_time: bool = True, update_time: bool = True, export: bool = True, auto_commit: bool = True,
-                 auto_alter: bool = True):
+                 insert_time: bool = True, update_time: bool = True, export: bool = False, auto_commit: bool = True,
+                 auto_alter: bool = True, logger_level=logging.INFO):
         """
         :param database:数据库路径，也可以是 :memory: 表示这是一个内存数据库
         :param timeout:连接超时时间
@@ -94,13 +88,16 @@ class DictToDb(object):
         :param isolation_level:事务隔离级别 可选值为 None(autocommit),"DEFERRED","IMMEDIATE","EXCLUSIVE"
         :param check_same_thread:是否只在一个线程中运行，默认为TRUE，若要多线程运行，请设置为FALSE
         :param cached_statements:缓存SQL语句的条数 默认100条
-        :param uri:如果 uri 为真，则 database 被解释为 URI,它允许您指定选项。 例如，以只读模式打开数据库 sqlite3.connect('file:path/to/database?mode=ro', uri =True)
-        :param row_factory:指定row_factory回调函数，默认的回调函数，会将查询出的结果行转换为dict,如果为了性能可以使用sqlite3.row替换默认的dict_factory,设置为none则返回为tuple类型
+        :param uri:如果 uri 为真，则 database 被解释为 URI,它允许您指定选项。 例如，以只读模式打开数据库
+         sqlite3.connect('file:path/to/database?mode=ro', uri =True)
+        :param row_factory:指定row_factory回调函数，默认的回调函数，会将查询出的结果行转换为dict,
+        如果为了性能可以使用sqlite3.row替换默认的dict_factory,设置为none则返回为tuple类型
         :param insert_time 默认是否给表添加插入时间数据列，这里是全局设置，可以被方法内的insert_time参数局部覆盖
         :param update_time 默认是否给表添加更新时间数据列， 这里是全局设置，可以被方法内的update_time参数局部覆盖
         :param export 默认是否给表添加export数据列 ，这里是全局设置，可以被方法内的export参数局部覆盖
         :param auto_commit 是否自动执行commit语句，这里是全局设置，可以被方法内的commit参数局部覆盖
         :param auto_alter 是否自动执行alter 表结构，这里是全局设置，可以被方法内的auto_alter参数局部覆盖
+        :param logger_level  可以输出的日志级别
         """
         self.db = sqlite3.connect(database, timeout=timeout, detect_types=detect_types, isolation_level=isolation_level,
                                   check_same_thread=check_same_thread, cached_statements=cached_statements,
@@ -122,6 +119,12 @@ class DictToDb(object):
         self._re_pattern = {
             "pk": re.compile(r'primary\s+key$')
         }
+        self.log = logging.getLogger("dict_to_db")
+        formatter = logging.Formatter('%(asctime)s %(levelname)-5s: %(message)s')
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        self.log.addHandler(console_handler)
+        self.log.setLevel(logger_level)
         if not check_same_thread:
             self.lock = Lock()
         if row_factory:
@@ -242,7 +245,7 @@ class DictToDb(object):
         if table_name is None:
             table_name = self._get_table_name_by_dict_keys(insert_data, insert_time, update_time, export)
         if table_name not in self._tables.keys():
-            create_table_sql = self._create_table_by_dict(insert_data, table_name, insert_time, update_time, export)
+            self._create_table_by_dict(insert_data, table_name, insert_time, update_time, export)
         replace_sql = self._get_replace_sql_by_dict(insert_data, table_name)
         try:
             self._execute_replace_sql(data, insert_data, replace_sql, table_name)
@@ -334,7 +337,8 @@ class DictToDb(object):
         :param title_to_column_name: 是否根据Excel表格里面的表格标题名，做字段名，如果设置为false，则column名规则类似Excel表格从A-z 然后是AA-AZ 然后是BA-BZ...
         :param title_row_index: 每个sheet标题列所在的位置，默认为Excel中的第一列 如：{"sheet1":3} #sheet的title以第三行为准
         :param data_row_start_index: 每个sheet数据列起始位置，默认为Excel中的第二列开始 如：{"sheet1":20} # sheet1的数据从第20行开始保存
-        :param columns_desc: 给指定的Excel列设置建表的描述信息，如设置为主键，unique等以及给某列设置数据库中存储类型 如: {'sheet1':{'A1':'@text#pk__not null__unique'}}
+        :param columns_desc: 给指定的Excel列设置建表的描述信息，
+        如设置为主键，unique等以及给某列设置数据库中存储类型 如: {'sheet1':{'A1':'@text#pk__not null__unique'}}
         :param columns_pretreatment_function: 给指定的Excel列 设置预处理函数，如 {'sheet1':{'A1':lambda x:float(x)}}
         :param appends_data: 插入Excel不包含的额外的数据列到数据库中，如给sheet1中的每行数据多插入一条 age数据：{'sheet1':{'age@text#pk':33}}
         :param insert_time: 是否添加插入时间列
@@ -344,21 +348,23 @@ class DictToDb(object):
         :param ignore_error: 是否在单次保存中忽略某些异常以保证，文件数据全部保存到Excel中
         """
         start_time = time.time()
-        print(f"加载 {excel} 并保存到db中....")
+        self.log.info(f"加载 {excel} 并保存到db中....")
         wb = load_workbook(excel, read_only=True)
         try:
             sheet_names = wb.sheetnames
+            total_count = 0
+            save_count = 0
             for sheet_count, sheet_name in enumerate(sheet_names):
                 ws = wb[sheet_name]
                 sheet_column_desc = columns_desc.get(sheet_name, {}) if columns_desc else {}
                 sheet_append_data = appends_data.get(sheet_name, {}) if appends_data else {}
                 sheet_title_index = title_row_index.get(sheet_name, 1) if title_row_index else 1
                 sheet_data_row_start_index = data_row_start_index.get(sheet_name, 2) if data_row_start_index else 2
-                sheet_columns_pretreatment_function = columns_pretreatment_function.get(sheet_name,
-                                                                                        {}) if columns_pretreatment_function else {}
+                sheet_columns_pretreatment_function = \
+                    columns_pretreatment_function.get(sheet_name, {}) if columns_pretreatment_function else {}
                 column_names, create_table_dict, first_column_names = \
                     self._get_create_table_dict_by_excel_sheet(ws, title_to_column_name, sheet_title_index,
-                                                               sheet_data_row_start_index, sheet_count,
+                                                               sheet_data_row_start_index,
                                                                transform_string,
                                                                sheet_column_desc, sheet_append_data)
                 if not column_names:
@@ -371,7 +377,8 @@ class DictToDb(object):
                         table_name = table_names.get(sheet_name)
                 for count, row in enumerate(ws.rows):
                     try:
-                        if count >= sheet_data_row_start_index:
+                        total_count += 1
+                        if count >= sheet_data_row_start_index - 1:
                             data = {}
                             blank_line = True  # 判断数据是不是全空
                             for cell_count, cell in enumerate(row):
@@ -400,13 +407,14 @@ class DictToDb(object):
                                 elif execute_func == "replace":
                                     self.insert_or_replace(data, table_name, commit=False, insert_time=insert_time,
                                                            update_time=update_time, export=export, auto_alter=False)
+                                save_count += 1
                     except Exception as e:
                         if ignore_error and isinstance(e, ignore_error):
-                            log.warning(e)
+                            self.log.debug(e)
                         else:
                             raise e
                 self._commit(commit=True)
-            print(f"保存完成，共耗时：{round((time.time() - start_time), 2)} S")
+            self.log.info(f"加载{total_count}条，保存或更新{save_count}条，共耗时：{round((time.time() - start_time), 2)} S")
         finally:
             wb.close()
 
@@ -420,10 +428,12 @@ class DictToDb(object):
         每个sheet 内容行第一行为字段名，后续的[1:]行则会保存到数据库
         :param excel: Excel文件路径
         :param transform_string:是否将所有表格的值转化为字符串返回
-        :param title_to_column_name: 是否根据Excel表格里面的表格标题名，做dict Key，如果设置为false，则Dict 的Key规则类似Excel表格从A-z 然后是AA-AZ 然后是BA-BZ...
+        :param title_to_column_name: 是否根据Excel表格里面的表格标题名，做dict Key，
+        如果设置为false，则Dict 的Key规则类似Excel表格从A-z 然后是AA-AZ 然后是BA-BZ...
         :param title_row_index: 每个sheet标题列所在的位置，默认为Excel中的第一列 如：{"sheet1":3} #sheet的title以第三行为准
         :param data_row_start_index: 每个sheet数据列起始位置，默认为Excel中的第二列开始 如：{"sheet1":20} # sheet1的数据从第20行开始保存
-        :param columns_desc: 给指定的Excel列设置建表的描述信息，如设置为主键，unique等以及给某列设置数据库中存储类型 如: {'sheet1':{'A1':'@text#pk__not null__unique'}}
+        :param columns_desc: 给指定的Excel列设置建表的描述信息，如设置为主键，unique等以及给某列设置数据库中存储类型
+        如: {'sheet1':{'A1':'@text#pk__not null__unique'}}
         :param columns_pretreatment_function: 给指定的Excel列 设置预处理函数，如 {'sheet1':{'A1':lambda x:float(x)}}
         :param appends_data: 插入Excel不包含的额外的数据列到数据库中，如给sheet1中的每行数据多插入一条 age数据：{'sheet1':{'age@text#pk':33}}
         :param ignore_error: 是否在单次保存中忽略某些异常以保证，文件数据全部保存到Excel中
@@ -439,12 +449,11 @@ class DictToDb(object):
                 sheet_append_data = appends_data.get(sheet_name, {}) if appends_data else {}
                 sheet_title_index = title_row_index.get(sheet_name, 1) if title_row_index else 1
                 sheet_data_row_start_index = data_row_start_index.get(sheet_name, 2) if data_row_start_index else 2
-                sheet_columns_pretreatment_function = columns_pretreatment_function.get(sheet_name,
-                                                                                        {}) if columns_pretreatment_function else {}
+                sheet_columns_pretreatment_function = \
+                    columns_pretreatment_function.get(sheet_name, {}) if columns_pretreatment_function else {}
                 column_names, create_table_dict, first_column_names = \
                     self._get_create_table_dict_by_excel_sheet(ws, title_to_column_name, sheet_title_index,
-                                                               sheet_data_row_start_index, sheet_count,
-                                                               transform_string,
+                                                               sheet_data_row_start_index, transform_string,
                                                                sheet_column_desc, sheet_append_data)
                 if not column_names:
                     continue
@@ -473,7 +482,7 @@ class DictToDb(object):
                                 yield data
                     except Exception as e:
                         if ignore_error and isinstance(e, ignore_error):
-                            log.warning(e)
+                            self.log.warning(e)
                         else:
                             raise e
             print(f"加载完成，共耗时：{round((time.time() - start_time), 2)} S")
@@ -487,7 +496,7 @@ class DictToDb(object):
         """
         从数据库导出数据到Excel表格中
         :param sql: 查询的sql语句
-        :param excel: Excel文件路径，如果Excel参数为None，则导出文件名格式为：f'dict_to_db_export_{datetime.now()}.xlsx'
+        :param excel: Excel文件路径，如果Excel参数为None，则导出文件名格式为：f 'dict_to_db_export_{datetime.now()}.xlsx'
         :param transform_string:是否将数据库中的值转化为字符串存储到Excel中
         :param sql_value:sql 位置参数的值
         :param not_save_column 查询出来字段中，不保存到Excel的字段
@@ -520,7 +529,7 @@ class DictToDb(object):
             print(f"导出：{excel}")
             if auto_update_export:
                 update = {'export': 1}
-                updates = [update for i in range(len(update_data))]
+                updates = [update] * len(update_data)
                 self.update(updates, where=update_data, table_name=update_export_table_name)
         else:
             print(f"当前查询无数据导出...")
@@ -573,7 +582,8 @@ class DictToDb(object):
         :param name:函数名
         :param num_params:该函数所接受的形参个数（如果 num_params 为 -1，则该函数可接受任意数量的参数）
         :param func:func 是一个 Python 可调用对象，它将作为 SQL 函数被调用
-        :param deterministic:如果 deterministic 为真值，则所创建的函数将被标记为 deterministic，这允许 SQLite 执行额外的优化。 此旗标在 SQLite 3.8.3 或更高版本中受到支持，如果在旧版本中使用将引发 NotSupportedError
+        :param deterministic:如果 deterministic 为真值，则所创建的函数将被标记为 deterministic，这允许 SQLite 执行额外的优化。
+         此旗标在 SQLite 3.8.3 或更高版本中受到支持，如果在旧版本中使用将引发 NotSupportedError
         """
         if self._check_same_thread:
             self.db.create_function(name, num_params, func, deterministic=deterministic)
@@ -714,11 +724,11 @@ class DictToDb(object):
             column_info_list.append(column_info)
             if pk_column:
                 pk_column_list.append(pk_column)
-        if insert_time:
+        if insert_time and 'insert_time' not in data.keys():
             column_info_list.append("insert_time timestamp default (datetime('now','localtime'))")
-        if update_time:
+        if update_time and 'update_time' not in data.keys():
             column_info_list.append('update_time timestamp')
-        if export:
+        if export and 'export' not in data.keys():
             column_info_list.append('export boolean default false')
         if pk_column_list:
             column_info_list.append(f"primary key ({','.join(pk_column_list)})")
@@ -745,11 +755,15 @@ class DictToDb(object):
             column_type = "".join(re.findall(r'@(\w+)[#]*', key))
         elif isinstance(value, (str, int, float, bool, datetime.date, datetime.datetime)):
             column_type = TABLE_TYPE_INFO[type(value)]
-        elif isinstance(value, (list, dict, set, tuple)):
+        elif isinstance(value, (list, set, tuple)):
             if value == eval(str(value)):
                 column_type = TABLE_TYPE_INFO[type(value)]
             else:
                 column_type = "obj"
+        elif isinstance(value, dict):
+            column_type = "obj"
+            if json.loads(json.dumps(value)) == value:
+                column_type = TABLE_TYPE_INFO[type(value)]
         elif isinstance(value, object):
             column_type = 'obj'
         else:
@@ -789,7 +803,7 @@ class DictToDb(object):
             else:
                 insert_column_names.append(f"[{column}]")
         columns = ", ".join(insert_column_names)
-        values = ",".join(['?' for i in range(len(insert_column_names))])
+        values = ",".join(['?'] * len(insert_column_names))
         insert_sql = INSERT_SQL_TEMPLATE.format(table_name=table_name, columns=columns, values=values)
         self._insert_sql[insert_sql_key] = insert_sql
         return insert_sql
@@ -810,7 +824,7 @@ class DictToDb(object):
             else:
                 insert_column_names.append(f"[{column}]")
         columns = ", ".join(insert_column_names)
-        values = ",".join(['?' for i in range(len(insert_column_names))])
+        values = ",".join(['?'] * len(insert_column_names))
         insert_or_update_sql = INSERT_SQL_TEMPLATE.format(table_name=table_name, columns=columns, values=values)
         self._insert_or_update_sql[insert_or_update_sql_key] = insert_or_update_sql
         return insert_or_update_sql
@@ -846,7 +860,7 @@ class DictToDb(object):
             else:
                 replace_column_names.append(f"[{column}]")
         columns = ", ".join(replace_column_names)
-        values = ",".join(['?' for i in range(len(replace_column_names))])
+        values = ",".join(['?'] * len(replace_column_names))
         replace_sql = REPLACE_SQL_TEMPLATE.format(table_name=table_name, columns=columns, values=values)
         self._replace_sql[replace_sql_key] = replace_sql
         return replace_sql
@@ -883,13 +897,13 @@ class DictToDb(object):
                 where_column = str(e).replace("UNIQUE constraint failed: ", "").replace(f"{table_name}.",
                                                                                         '').split(", ")
                 update_data, where_data = self._get_update_data_by_where_column(data, where_column)
-                self.update(update_data, where_data, table_name=table_name, commit=commit, update_time=update_time,
+                self.update(update_data, where_data, table_name=table_name, commit=commit, update_time=auto_update_time,
                             auto_alter=auto_alter)
             else:
                 raise e
         except Exception as e:
             if ignore_error and isinstance(e, ignore_error):
-                log.warning(e)
+                self.log.warning(e)
             else:
                 raise e
 
@@ -952,7 +966,7 @@ class DictToDb(object):
 
     @staticmethod
     def _get_delete_sql(table_name: str, where: dict):
-        return DELETE_SQL_TEMPLATE.format(table_name=table_name, where=f"{'=?,'.join(where.keys())}=?")
+        return DELETE_SQL_TEMPLATE.format(table_name=table_name, where=f"{'=? and '.join(where.keys())}=?")
 
     def _get_update_column_and_where_values(self, update_data: dict, where: dict, update_time: bool, table_name: str):
         if update_time and 'update_time' not in update_data.keys():
@@ -984,7 +998,7 @@ class DictToDb(object):
 
     @staticmethod
     def _get_create_table_dict_by_excel_sheet(ws, title_to_column_name, title_row_index, data_row_start_index,
-                                              sheet_count, transform_string, sheet_column_desc, sheet_append_data):
+                                              transform_string, sheet_column_desc, sheet_append_data):
         column_names = []
         column_values = []
         for count, row in enumerate(ws.rows):
