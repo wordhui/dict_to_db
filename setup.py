@@ -1,11 +1,11 @@
 import setuptools
 
-with open("README.md", "r") as fh:
+with open("README.md", "r", encoding='utf8') as fh:
     long_description = fh.read()
 
 setuptools.setup(
     name="dict_to_db",
-    version="0.0.6",
+    version="0.0.7",
     author="poshui",
     author_email="poshui@foxmail.com",
     description="便捷的将dict对象存储到Database[sqlite]中 \nConveniently store the dict object in Database[sqlite]",
